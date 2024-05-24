@@ -1,0 +1,158 @@
+import subprocess
+import csv
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
+from Bio.Seq import Seq
+import os
+
+# Paths to input and output files for sequence merging
+input_forward = "/path/to/your/forward.fq"  # Path to the forward sequence file
+input_reverse = "/path/to/your/reverse.fq"  # Path to the reverse sequence file
+output_merged = "/path/to/your/merged.fasta"  # Path to the output merged file
+
+# Use VSEARCH to merge paired-end sequences
+vsearch_command = f"vsearch --fastq_mergepairs {input_forward} --reverse {input_reverse} --fastqout {output_merged}"
+subprocess.run(vsearch_command, shell=True)
+
+print(f"Merging completed, result saved in {output_merged}")
+
+# Paths for FastQC and Trimmomatic processing
+input_fastq = output_merged  # Use the merged file from the previous step
+output_dir = "/path/to/your/fastqc_output"  # Directory for FastQC output
+output_fastq = "/path/to/your/output_trimmed.fastq"  # Path to the trimmed output file
+
+# Create output directory for FastQC
+subprocess.run(["mkdir", "-p", output_dir])
+
+# Run FastQC on the merged sequences
+subprocess.run(["fastqc", input_fastq, "-o", output_dir])
+
+# Run Trimmomatic for sequence trimming
+subprocess.run(["trimmomatic", "SE", "-phred33", input_fastq, output_fastq, "LEADING:3", "TRAILING:3", "SLIDINGWINDOW:4:15"])
+
+def read_barcodes_from_csv(csv_file):
+    """Reads barcodes from a CSV file."""
+    barcodes = []
+    with open(csv_file, 'r') as csvfile:
+        csvreader = csv.reader(csvfile)
+        next(csvreader)
+        for row in csvreader:
+            barcode = row[0].strip()
+            barcodes.append(barcode)
+    return barcodes
+
+def correct_sequence(sequence):
+    """Corrects a sequence by complementing and reversing it."""
+    base_F = "ATCG"
+    base_R = "TAGC"
+    new_list = []
+
+    for base in sequence:
+        if base in base_F:
+            index = base_F.index(base)
+            new_list.append(base_R[index])
+
+    result = ''.join(new_list)
+    result_1 = result[::-1]
+    return result_1
+
+def classify_by_barcodes_from_csv(input_fastq, csv_file, output_directory="/path/to/output"):
+    """Classifies sequences by barcodes read from a CSV file."""
+    barcode_list = read_barcodes_from_csv(csv_file)
+    barcode_handles = {barcode: {"handle": open(os.path.join(output_directory, f"{barcode}_output.fastq"), "w"), "path": os.path.abspath(os.path.join(output_directory, f"{barcode}_output.fastq"))} for barcode in barcode_list}
+    unmatched_handle = open(os.path.join(output_directory, "unmatched_output.fastq"), "w")
+
+    with open(input_fastq, "r") as handle:
+        for record in SeqIO.parse(handle, "fastq"):
+            barcode = str(record.seq[:12])
+            if barcode in barcode_list:
+                trimmed_sequence = str(record.seq[12:])
+                qualities = record.letter_annotations.get('phred_quality', [])
+                if len(qualities) != len(trimmed_sequence):
+                    qualities = [30] * len(trimmed_sequence)
+
+                new_record = SeqRecord(seq=Seq(trimmed_sequence), id=record.id, name=record.name, description=record.description)
+                new_record.letter_annotations["phred_quality"] = qualities
+
+                SeqIO.write(new_record, barcode_handles[barcode]["handle"], "fastq")
+            else:
+                # If barcode is not matched, try correcting the sequence
+                corrected_sequence = correct_sequence(str(record.seq))
+                corrected_barcode = corrected_sequence[:12]
+                if corrected_barcode in barcode_list:
+                    trimmed_sequence = corrected_sequence[12:]
+                    qualities = record.letter_annotations.get('phred_quality', [])
+                    if len(qualities) != len(trimmed_sequence):
+                        qualities = [30] * len(trimmed_sequence)
+
+                    new_record = SeqRecord(seq=Seq(trimmed_sequence), id=record.id, name=record.name, description=record.description)
+                    new_record.letter_annotations["phred_quality"] = qualities
+
+                    SeqIO.write(new_record, barcode_handles[corrected_barcode]["handle"], "fastq")
+                else:
+                    # If still unmatched, write to the unmatched file
+                    SeqIO.write(record, unmatched_handle, "fastq")
+
+    for handle_info in barcode_handles.values():
+        handle_info["handle"].close()
+
+    unmatched_handle.close()
+
+    return barcode_handles
+
+if __name__ == "__main__":
+    input_fastq_file = "/path/to/your/output_trimmed.fastq"  # Path to the input FASTQ file
+    barcode_csv_file = "/path/to/your/barcode-F.csv"  # Path to the CSV file containing barcodes
+    output_directory = "/path/to/your/output"  # Path to the output directory
+    result = classify_by_barcodes_from_csv(input_fastq_file, barcode_csv_file, output_directory)
+    print("Records classified by barcode:")
+    for barcode, count in result.items():
+        print(f"{barcode}: {count} records")
+
+# Read configuration and analyze sequences
+config_file = '/path/to/your/config_file.csv'  # Path to the configuration CSV file
+results = []
+
+with open(config_file, 'r') as csvfile:
+    reader = csv.DictReader(csvfile)
+    for row in reader:
+        file_path = row['\ufefffile_path']
+        template = row['template']
+        spacer = row['spacer']
+        base_windows = int(row['base_windows'])
+
+        sequences = []
+        with open(file_path, 'r') as file:
+            line_number = 0
+            for line in file:
+                line_number += 1
+                if line_number % 4 == 2:
+                    sequences.append(line.strip())
+
+        ind = template.index(spacer)
+        base_windows_ind = ind + base_windows - 1
+
+        num_A = 0
+        num_T = 0
+        num_C = 0
+        num_G = 0
+
+        for seq in sequences:
+            if len(seq) > base_windows_ind:
+                if seq[base_windows_ind] == 'A':
+                    num_A += 1
+                elif seq[base_windows_ind] == 'T':
+                    num_T += 1
+                elif seq[base_windows_ind] == 'C':
+                    num_C += 1
+                elif seq[base_windows_ind] == 'G':
+                    num_G += 1
+
+        results.append([spacer, base_windows, num_A, num_T, num_C, num_G])
+
+# Write the results to a CSV file
+output_file = '/path/to/your/results.csv'  # Path to the output CSV file
+with open(output_file, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(["file_path", 'Spacer', 'Base Windows', 'A', 'T', 'C', 'G'])
+    writer.writerows(results)
